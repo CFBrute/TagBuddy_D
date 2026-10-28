@@ -539,7 +539,7 @@ public partial class NfcPage : ContentPage
             List<ulong>? candidates = null;
             for (int round = 0; round < 4 && (candidates is null || candidates.Count > 1); round++)
             {
-                var n = await usb.MifareNestedAsync(0, keyB: false, defaultKey, targetBlock, targetKeyB: false, calibrate: round == 0);
+                var n = await usb.MifareNestedAsync(0, knownKeyB: false, defaultKey, targetBlock, targetKeyB: false, calibrate: round == 0);
                 if (n is null) { AppendProxmarkLog("No nonces collected — is sector 0 still on the default key?"); break; }
                 AppendProxmarkLog($"round {round}: cuid {n.Cuid:X8}  nt {n.Nt0:X8}/{n.Nt1:X8}  ks {n.Ks0:X8}/{n.Ks1:X8}");
                 foreach (var (nt, ks) in new[] { (n.Nt0, n.Ks0), (n.Nt1, n.Ks1) })
