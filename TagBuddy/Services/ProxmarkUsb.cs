@@ -738,7 +738,7 @@ public sealed class ProxmarkUsb
     }
 
     /// <summary>The encrypted nonces one NESTED call collects, for recovering <see cref="TargetBlock"/>'s key.</summary>
-    public sealed record NestedNonces(uint Cuid, uint Nt0, uint Ks0, uint Nt1, uint Ks1, int TargetBlock, bool TargetKeyB);
+    public sealed record NestedNonces(uint Cuid, uint Nt0, uint Ks0, uint Nt1, uint Ks1, int TargetBlock, bool TargetKeyB, uint AuthTimeout = 0, uint FixedNt = 0);
 
     /// <summary>Collects a pair of encrypted nonces for the nested attack: authenticates <paramref name="knownBlock"/>
     /// with a known key, then asks the card to authenticate <paramref name="targetBlock"/> and captures the nonces it
@@ -762,7 +762,7 @@ public sealed class ProxmarkUsb
         var d = ReplyData(ack, 28);
         if (d is null) { Say("Nested: reply too short to hold the nonce block."); return null; }
         uint U(int o) => (uint)(d[o] | d[o + 1] << 8 | d[o + 2] << 16 | d[o + 3] << 24);
-        return new NestedNonces(U(0), U(4), U(8), U(12), U(16), targetBlock, targetKeyB);
+        return new NestedNonces(U(0), U(4), U(8), U(12), U(16), targetBlock, targetKeyB, U(20), U(24));
     }
 
     /// <summary>An open, claimed, CDC-configured connection to the Proxmark; releasing it on dispose.</summary>

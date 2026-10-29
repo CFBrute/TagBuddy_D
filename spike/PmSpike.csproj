@@ -13,4 +13,9 @@
     <PackageReference Include="System.IO.Ports" Version="9.0.0" />
   </ItemGroup>
 
+  <!-- Reuse the app's Crypto1 solver here so the nested attack is proven on hardware before trusting it in the app. -->
+  <ItemGroup>
+    <Compile Include="..\TagBuddy\Services\Crypto1.cs" />
+  </ItemGroup>
+
 </Project>

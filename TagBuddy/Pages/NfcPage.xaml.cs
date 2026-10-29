@@ -516,6 +516,23 @@ public partial class NfcPage : ContentPage
     /// intersect the two nonce lists), and proves each surviving candidate by reading the target block with it. The
     /// known key defaults to FFFFFFFFFFFF on block 0. Still to confirm on hardware: the OLD-firmware nested reply
     /// matches the field layout assumed here.</summary>
+    // 48-bit key (6 bytes, big-endian) from 12 hex chars, or null if blank/malformed — for the optional
+    // "known key" that lets the nested flow verify which nonce byte order the firmware uses.
+    private static ulong? ParseKey6(string? hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex)) return null;
+        hex = hex.Replace(" ", "").Replace("0x", "").Replace("0X", "");
+        if (hex.Length != 12) return null;
+        try { ulong v = 0; for (int i = 0; i < 6; i++) v = (v << 8) | Convert.ToByte(hex.Substring(i * 2, 2), 16); return v; }
+        catch { return null; }
+    }
+
+    private static uint Bswap32(uint x) => (x >> 24) | ((x >> 8) & 0xff00) | ((x << 8) & 0xff0000) | (x << 24);
+
+    // The keystream word Crypto1 produces from <paramref name="key"/> when <paramref name="input"/> is clocked in —
+    // the forward of lfsr_recovery32, used to test which (uid,nt,ks) byte order a known key reproduces.
+    private static uint KeystreamOf(ulong key, uint input) => Crypto1.Word(Crypto1State.FromKey(key), input, false);
+
     private async void OnProxmarkRecover(object? sender, EventArgs e)
     {
         string? input = await DisplayPromptAsync("Recover a key (nested)",
@@ -529,6 +546,14 @@ public partial class NfcPage : ContentPage
         int targetBlock = sector < 32 ? sector * 4 : 128 + (sector - 32) * 16;
         byte[] defaultKey = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
 
+        // Optional: if we already know the target key (e.g. the card is still all-default, so this sector's key A is
+        // FFFFFFFFFFFF), the attack reports which nonce byte order reproduces it — proving the device->solver mapping
+        // without any card writes. Blank = just attempt recovery.
+        string? knownInput = await DisplayPromptAsync("Validate mapping (optional)",
+            "If you already know sector {0}'s key A, enter it to prove the attack. On an all-default card this is FFFFFFFFFFFF. Leave blank to just attempt recovery.".Replace("{0}", sector.ToString()),
+            accept: "Use", cancel: "Skip", placeholder: "FFFFFFFFFFFF", maxLength: 12);
+        ulong? expectKey = ParseKey6(knownInput);
+
         ProxmarkRecoverButton.IsEnabled = false;
         await WithProxmarkLog(async usb =>
         {
@@ -536,18 +561,42 @@ public partial class NfcPage : ContentPage
             // Each nonce gives tens of thousands of candidates; the real key is the one common to all of them, so the
             // candidate sets are INTERSECTED across nonces. (How the encrypted nonce maps to the solver's plaintext
             // nt + keystream is the device-side part still to be nailed down on hardware — see TODO.)
+            if (expectKey is not null) AppendProxmarkLog($"Validating against known key {expectKey.Value:X12} — will report the matching nonce byte order.");
             List<ulong>? candidates = null;
+            bool mappingShown = false;
             for (int round = 0; round < 4 && (candidates is null || candidates.Count > 1); round++)
             {
                 var n = await usb.MifareNestedAsync(0, knownKeyB: false, defaultKey, targetBlock, targetKeyB: false, calibrate: round == 0);
                 if (n is null) { AppendProxmarkLog("No nonces collected — is sector 0 still on the default key?"); break; }
                 AppendProxmarkLog($"round {round}: cuid {n.Cuid:X8}  nt {n.Nt0:X8}/{n.Nt1:X8}  ks {n.Ks0:X8}/{n.Ks1:X8}");
+                AppendProxmarkLog($"  raw: timeout {n.AuthTimeout}  fixed_nt {n.FixedNt:X8}");
                 foreach (var (nt, ks) in new[] { (n.Nt0, n.Ks0), (n.Nt1, n.Ks1) })
                 {
+                    // Diagnostic: which (uid,nt,ks) byte order reproduces the known key? Pins down the firmware mapping.
+                    if (expectKey is ulong K && !mappingShown)
+                    {
+                        (string Label, uint Value)[] inputs =
+                        [
+                            ("uid^nt", n.Cuid ^ nt), ("bswap(uid)^nt", Bswap32(n.Cuid) ^ nt), ("uid^bswap(nt)", n.Cuid ^ Bswap32(nt)),
+                            ("bswap(uid^nt)", Bswap32(n.Cuid ^ nt)), ("bswap(uid)^bswap(nt)", Bswap32(n.Cuid) ^ Bswap32(nt)),
+                            ("nt", nt), ("bswap(nt)", Bswap32(nt)),
+                        ];
+                        foreach (var (iLbl, iVal) in inputs)
+                            foreach (var (kLbl, kVal) in new[] { ("ks", ks), ("bswap(ks)", Bswap32(ks)) })
+                                if (KeystreamOf(K, iVal) == kVal)
+                                {
+                                    AppendProxmarkLog($"  ►MAPPING: input={iLbl}, keystream={kLbl} reproduces the key.");
+                                    mappingShown = true;
+                                }
+                    }
                     var set = Crypto1.Nonce2Key(n.Cuid, nt, ks);
+                    if (expectKey is ulong Kc)
+                        AppendProxmarkLog($"  nt {nt:X8}: {set.Count} candidates, known key {(set.Contains(Kc) ? "PRESENT" : "absent")}.");
                     candidates = candidates is null ? set : Crypto1.Intersect(candidates, set);
                 }
             }
+            if (expectKey is not null && !mappingShown)
+                AppendProxmarkLog("No simple byte order reproduced the key — nt may be the PRNG-predicted nonce, or ks defined differently. The raw dumps above are the clue.");
             if (candidates is null || candidates.Count == 0)
             {
                 AppendProxmarkLog("No key recovered from these nonces. If sector 0 is on the default key, collect again; otherwise the nonce format may differ on this firmware (see TODO).");
@@ -784,8 +833,16 @@ public partial class NfcPage : ContentPage
         ProxmarkWriteButton.IsEnabled = true;
     }
 
-    private void AppendProxmarkLog(string line) => MainThread.BeginInvokeOnMainThread(() =>
-        ProxmarkLog.Text = string.IsNullOrEmpty(ProxmarkLog.Text) ? line : ProxmarkLog.Text + "\n" + line);
+    private void AppendProxmarkLog(string line)
+    {
+#if ANDROID
+        // Mirror to logcat (tag "TagBuddyPM") so the recover/nested log can be captured over adb — including adb
+        // over Wi-Fi, which works while the Proxmark occupies the phone's USB port via OTG.
+        Android.Util.Log.Info("TagBuddyPM", line);
+#endif
+        MainThread.BeginInvokeOnMainThread(() =>
+            ProxmarkLog.Text = string.IsNullOrEmpty(ProxmarkLog.Text) ? line : ProxmarkLog.Text + "\n" + line);
+    }
 
     // ---------------------------------------------------------------- tag password
 

@@ -1,4 +1,5 @@
 using System.IO.Ports;
+using TagBuddy.Services;
 
 // Proxmark3 protocol spike. Usage:
 //   dotnet run --                     -> list COM ports
@@ -451,6 +452,90 @@ if (cmd == "mfchk")
         SendAuth(0x0620, (ulong)blk, kt, 0, ReadbData(key), 3, out ulong ok);
         Console.WriteLine($"  {h}: {(ok != 0 ? "*** OPENS ***" : "no")}");
     }
+    return;
+}
+
+// nested <targetSector=1> [knownKeyHex=FFFFFFFFFFFF] [rounds=5] [expectKeyHex]
+// Collects encrypted nonces for the target sector (NESTED 0x0612) using a known key on sector 0, then runs the
+// Crypto1 solver. If expectKeyHex is given (the key you wrote to the target with mfwritekey — recorded ONLY for
+// this check), it forward-verifies which byte order of the firmware's nt/ks reproduces that key: that pins down
+// the device->solver mapping the TODO calls out, without ever feeding the key into the recovery itself.
+if (cmd == "nested")
+{
+    int tSector = args.Length > 2 ? (int)ParseU(args[2]) : 1;
+    byte[] known = args.Length > 3 ? ParseKey(args[3]) : DefaultKey;
+    int rounds = args.Length > 4 ? (int)ParseU(args[4]) : 5;
+    byte[]? expect = args.Length > 5 ? ParseKey(args[5]) : null;
+    int knownBlock = 0, targetBlock = tSector * 4;
+
+    static ulong KeyToU64(byte[] k) => ((ulong)k[0] << 40) | ((ulong)k[1] << 32) | ((ulong)k[2] << 24) | ((ulong)k[3] << 16) | ((ulong)k[4] << 8) | k[5];
+    static uint Bswap(uint x) => (x >> 24) | ((x >> 8) & 0xff00) | ((x << 8) & 0xff0000) | (x << 24);
+    static uint Ksw(ulong key, uint input) { var s = Crypto1State.FromKey(key); return Crypto1.Word(s, input, false); }
+
+    Console.WriteLine($"Nested: known = block {knownBlock} keyA {Hex(known)}, target = sector {tSector} (block {targetBlock}) keyA.");
+    if (expect is not null) Console.WriteLine($"  (diagnostic) expecting target key {Hex(expect)} — will report which nt/ks byte order reproduces it.");
+
+    List<ulong>? inter = null;
+    bool mappingShown = false;
+    for (int round = 0; round < rounds && (inter is null || inter.Count > 1); round++)
+    {
+        Drain(sp, "pre-nested");
+        var f = OldFrame(0x0612, (ulong)knownBlock, (ulong)targetBlock, round == 0 ? 1UL : 0UL, ReadbData(known));
+        sp.Write(f, 0, f.Length);
+        var ack = ReadAck(4000);
+        if (ack is null) { Console.WriteLine($"round {round}: no ACK (known key may not open sector 0, or the card moved)."); continue; }
+        var d = ack.AsSpan(32, 28).ToArray();
+        uint U(int o) => (uint)(d[o] | d[o + 1] << 8 | d[o + 2] << 16 | d[o + 3] << 24);
+        uint cuid = U(0), nt0 = U(4), ks0 = U(8), nt1 = U(12), ks1 = U(16), tmo = U(20), fnt = U(24);
+        Console.WriteLine($"round {round}: raw {Hex(d)}");
+        Console.WriteLine($"  cuid {cuid:X8}  nt0 {nt0:X8} ks0 {ks0:X8}  nt1 {nt1:X8} ks1 {ks1:X8}  timeout {tmo} fixed_nt {fnt:X8}");
+
+        var pairs = new[] { (nt0, ks0), (nt1, ks1) };
+
+        // Diagnostic: find the (uid, nt, ks) byte order that forward-reproduces the known key.
+        if (expect is not null && !mappingShown)
+        {
+            ulong K = KeyToU64(expect);
+            (string, uint)[] inputs(uint nt) =>
+            [
+                ("uid^nt", cuid ^ nt), ("bswap(uid)^nt", Bswap(cuid) ^ nt), ("uid^bswap(nt)", cuid ^ Bswap(nt)),
+                ("bswap(uid^nt)", Bswap(cuid ^ nt)), ("bswap(uid)^bswap(nt)", Bswap(cuid) ^ Bswap(nt)),
+                ("nt", nt), ("bswap(nt)", Bswap(nt)),
+            ];
+            foreach (var (nt, ks) in pairs)
+            {
+                foreach (var (iLbl, iVal) in inputs(nt))
+                    foreach (var (kLbl, kVal) in new[] { ("ks", ks), ("bswap(ks)", Bswap(ks)) })
+                        if (Ksw(K, iVal) == kVal)
+                        {
+                            Console.WriteLine($"  >>> MAPPING: input={iLbl}, keystream={kLbl} reproduces the known key. <<<");
+                            mappingShown = true;
+                        }
+            }
+            if (!mappingShown) Console.WriteLine("  (diagnostic) no simple byte-order combo reproduced the key — nt may be the PRNG-predicted nonce or ks defined differently; dump above is the clue.");
+        }
+
+        // Recovery with the as-coded mapping (uid=cuid, input=uid^nt, keystream=ks).
+        foreach (var (nt, ks) in pairs)
+        {
+            var set = Crypto1.Nonce2Key(cuid, nt, ks);
+            string has = expect is not null ? (set.Contains(KeyToU64(expect)) ? "  [contains expected key]" : "  [expected key NOT in set]") : "";
+            Console.WriteLine($"    nonce nt {nt:X8}: {set.Count} candidates{has}");
+            inter = inter is null ? set : Crypto1.Intersect(inter, set);
+        }
+        Console.WriteLine($"  intersection so far: {inter?.Count ?? 0}");
+    }
+
+    if (inter is null || inter.Count == 0) { Console.WriteLine("No key recovered. If the dump looks sane, the mapping line above tells you what to change."); return; }
+    Console.WriteLine($"{inter.Count} candidate(s) survived; proving on the card by reading block {targetBlock}…");
+    foreach (var cand in inter.Take(16))
+    {
+        var key = new byte[6];
+        for (int i = 0; i < 6; i++) key[i] = (byte)(cand >> (40 - 8 * i));
+        var r = SendAuth(0x0620, (ulong)targetBlock, 0, 0, ReadbData(key), 3, out ulong ok);
+        if (ok != 0) { Console.WriteLine($"  *** RECOVERED key A for sector {tSector}: {Hex(key)} *** (block {targetBlock}: {(r.Length >= 48 ? Hex(r.AsSpan(32, 16).ToArray()) : "")})"); return; }
+    }
+    Console.WriteLine("  none of the surviving candidates opened the sector — see the diagnostic above.");
     return;
 }
 
